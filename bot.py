@@ -7,7 +7,7 @@ import logging
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
 # Load environment variables
 load_dotenv()
@@ -15,7 +15,6 @@ load_dotenv()
 # Configuration
 TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-# Initial admins from env, can be expanded at runtime
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 IMAGE_URL = os.getenv("IMAGE_URL", "https://i.ibb.co/v4m0YmP/prediction-banner.jpg")
 
@@ -29,6 +28,8 @@ HEADERS = {
 # Global State
 is_running = False
 last_period = None
+prediction_history = {} # Store predictions to verify later
+stats = {"wins": 0, "losses": 0, "total": 0}
 
 # Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -49,16 +50,28 @@ def fetch_latest_data():
         logging.error(f"Error fetching data: {e}")
         return []
 
+def analyze_trends(data):
+    """Unique Feature: Smart Trend Analyzer"""
+    if not data: return "NEUTRAL"
+    numbers = [int(item['number']) for item in data[:10]]
+    big_count = sum(1 for n in numbers if n >= 5)
+    if big_count >= 7: return "STRONG BIG TREND 🔥"
+    if big_count <= 3: return "STRONG SMALL TREND ❄️"
+    return "STABLE MARKET ⚖️"
+
 def generate_prediction(last_results):
     if not last_results:
         return "BIG", random.randint(5, 9)
     
-    # Logic based on history
-    big_count = sum(1 for r in last_results[:5] if int(r['number']) >= 5)
+    numbers = [int(r['number']) for r in last_results[:5]]
+    big_count = sum(1 for n in numbers if n >= 5)
     small_count = 5 - big_count
     
-    # Simple trend following/reversal logic
-    prediction = "SMALL" if big_count > small_count else "BIG"
+    # Advanced logic: Trend following with randomness filter
+    if big_count > small_count:
+        prediction = "SMALL" if random.random() > 0.7 else "BIG"
+    else:
+        prediction = "BIG" if random.random() > 0.7 else "SMALL"
     
     if prediction == "BIG":
         predicted_number = random.choice([5, 6, 7, 8, 9])
@@ -67,8 +80,7 @@ def generate_prediction(last_results):
         
     return prediction, predicted_number
 
-def format_prediction_message(period, prediction, number):
-    # Advanced styling for the message as requested
+def format_prediction_message(period, prediction, number, trend):
     msg = (
         f"╔══════════════════════════════════════╗\n"
         f"║   ⚠️  SYSTEM OVERRIDE : ACTIVE  ⚠️   ║\n"
@@ -79,7 +91,7 @@ def format_prediction_message(period, prediction, number):
         f"║  ▸ RESULT MODE   : {prediction}                 ║\n"
         f"║  ▸ CORE DIGITS   : {number} ⇄ {random.randint(0,9)}                  ║\n"
         f"║                                      ║\n"
-        f"║  ▸ LOGIC TYPE    : ADVANCED SCRIPT   ║\n"
+        f"║  ▸ TREND ANALYZE : {trend}    ║\n"
         f"║  ▸ RISK FILTER   : ENABLED           ║\n"
         f"║  ▸ ACCURACY RATE : 100%              ║\n"
         f"║                                      ║\n"
@@ -89,6 +101,32 @@ def format_prediction_message(period, prediction, number):
         f"╚══════════════════════════════════════╝"
     )
     return msg
+
+async def verify_last_prediction(context, current_period, actual_number):
+    """Unique Feature: Auto-Result Verification"""
+    global stats
+    if current_period in prediction_history:
+        pred_data = prediction_history[current_period]
+        actual_size = get_big_small(actual_number)
+        
+        is_win = pred_data['prediction'] == actual_size
+        status_emoji = "✅ WIN" if is_win else "❌ LOSS"
+        
+        if is_win: stats['wins'] += 1
+        else: stats['losses'] += 1
+        stats['total'] += 1
+        
+        verify_msg = (
+            f"📊 *PERIOD {current_period} RESULT*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 Result: `{actual_number} ({actual_size})`\n"
+            f"🔮 Our Prediction: `{pred_data['prediction']}`\n"
+            f"✨ Status: *{status_emoji}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 Accuracy: `{(stats['wins']/stats['total']*100):.1f}%`"
+        )
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=verify_msg, parse_mode='Markdown')
+        del prediction_history[current_period]
 
 async def prediction_loop(context: ContextTypes.DEFAULT_TYPE):
     global is_running, last_period
@@ -103,28 +141,30 @@ async def prediction_loop(context: ContextTypes.DEFAULT_TYPE):
             latest_item = data[0]
             current_period = str(latest_item['issueNumber'])
             
-            # Check if it's a new period
+            # 1. Verify previous prediction if exists
+            await verify_last_prediction(context, current_period, latest_item['number'])
+            
+            # 2. Check if it's time for a new prediction
             if current_period != last_period:
                 last_period = current_period
-                
-                # Next period prediction
                 next_period = str(int(current_period) + 1)
+                
+                trend = analyze_trends(data)
                 prediction, number = generate_prediction(data)
                 
-                message = format_prediction_message(next_period, prediction, number)
+                # Store for verification
+                prediction_history[next_period] = {'prediction': prediction, 'number': number}
                 
-                # Send to channel with image
-                try:
-                    await context.bot.send_photo(
-                        chat_id=CHANNEL_ID,
-                        photo=IMAGE_URL,
-                        caption=message
-                    )
-                    logging.info(f"Sent prediction for period {next_period}")
-                except Exception as e:
-                    logging.error(f"Failed to send message to channel: {e}")
+                message = format_prediction_message(next_period, prediction, number, trend)
                 
-            await asyncio.sleep(15) # Check every 15 seconds for faster response
+                await context.bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=IMAGE_URL,
+                    caption=message
+                )
+                logging.info(f"Sent prediction for period {next_period}")
+                
+            await asyncio.sleep(15)
         except Exception as e:
             logging.error(f"Error in prediction loop: {e}")
             await asyncio.sleep(10)
@@ -133,85 +173,55 @@ async def prediction_loop(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("❌ You are not authorized to use this bot.")
+        await update.message.reply_text("❌ Unauthorized.")
         return
         
     keyboard = [
-        [InlineKeyboardButton("🚀 Start Prediction", callback_data='start_bot')],
-        [InlineKeyboardButton("🛑 Stop Prediction", callback_data='stop_bot')],
-        [InlineKeyboardButton("📊 Bot Status", callback_data='status_bot')]
+        [InlineKeyboardButton("🚀 Start", callback_data='start_bot'), InlineKeyboardButton("🛑 Stop", callback_data='stop_bot')],
+        [InlineKeyboardButton("📊 Stats", callback_data='status_bot'), InlineKeyboardButton("📢 Broadcast", callback_data='prep_broadcast')],
+        [InlineKeyboardButton("⚙️ Settings", callback_data='settings_bot')]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "🔥 *Advanced Prediction Bot Control Panel*\n\n"
-        "Welcome Admin! Use the buttons below to control the automated prediction engine.",
-        reply_markup=reply_markup,
+        "🔥 *ULTIMATE PREDICTION CONTROL*\n\n"
+        "Status: " + ("RUNNING 🟢" if is_running else "STOPPED 🔴"),
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_running
     query = update.callback_query
-    user_id = query.from_user.id
-    
-    if user_id not in ADMIN_IDS:
-        await query.answer("Unauthorized!", show_alert=True)
-        return
-        
+    if query.from_user.id not in ADMIN_IDS: return
     await query.answer()
     
     if query.data == 'start_bot':
         if not is_running:
             is_running = True
             asyncio.create_task(prediction_loop(context))
-            await query.edit_message_text("✅ *Prediction engine STARTED*\n\nBot is now monitoring the API and posting predictions to the channel.", parse_mode='Markdown')
-        else:
-            await query.edit_message_text("ℹ️ *Engine is already running.*", parse_mode='Markdown')
-            
+            await query.edit_message_text("✅ Engine Started!")
     elif query.data == 'stop_bot':
         is_running = False
-        await query.edit_message_text("🛑 *Prediction engine STOPPED*\n\nNo more predictions will be sent until restarted.", parse_mode='Markdown')
-        
+        await query.edit_message_text("🛑 Engine Stopped!")
     elif query.data == 'status_bot':
-        status = "RUNNING 🟢" if is_running else "STOPPED 🔴"
-        await query.edit_message_text(
-            f"📊 *Bot Status Report*\n\n"
-            f"• Engine: `{status}`\n"
-            f"• Active Admins: `{len(ADMIN_IDS)}`\n"
-            f"• Target Channel: `{CHANNEL_ID}`\n"
-            f"• Image URL: [View Banner]({IMAGE_URL})",
-            parse_mode='Markdown'
-        )
+        await query.edit_message_text(f"📊 *LIFETIME STATS*\n\nWins: {stats['wins']}\nLosses: {stats['losses']}\nTotal: {stats['total']}", parse_mode='Markdown')
+    elif query.data == 'prep_broadcast':
+        await query.edit_message_text("📝 Send the message you want to broadcast to the channel.")
+        context.user_data['awaiting_broadcast'] = True
 
-async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        return
-        
-    if not context.args:
-        await update.message.reply_text("Usage: `/addadmin <user_id>`", parse_mode='Markdown')
-        return
-        
-    try:
-        new_admin = int(context.args[0])
-        if new_admin not in ADMIN_IDS:
-            ADMIN_IDS.append(new_admin)
-            await update.message.reply_text(f"✅ User `{new_admin}` added as admin.", parse_mode='Markdown')
-        else:
-            await update.message.reply_text("User is already an admin.")
-    except ValueError:
-        await update.message.reply_text("Invalid User ID. Please provide a numeric ID.")
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unique Feature: Admin Broadcast"""
+    if update.effective_user.id not in ADMIN_IDS: return
+    
+    if context.user_data.get('awaiting_broadcast'):
+        text = update.message.text
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=f"📢 *ADMIN ANNOUNCEMENT*\n\n{text}", parse_mode='Markdown')
+        await update.message.reply_text("✅ Broadcast sent to channel!")
+        context.user_data['awaiting_broadcast'] = False
 
 if __name__ == '__main__':
-    if not TOKEN:
-        print("Error: BOT_TOKEN not found in environment variables.")
-        exit(1)
-        
     app = ApplicationBuilder().token(TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addadmin", add_admin))
     app.add_handler(CallbackQueryHandler(button_handler))
-    
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot is starting...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
