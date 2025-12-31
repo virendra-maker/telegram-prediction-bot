@@ -4,19 +4,17 @@ import random
 import requests
 import asyncio
 import logging
+import json
 from datetime import datetime
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
-# Load environment variables
-load_dotenv()
-
-# Configuration
-TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
-IMAGE_URL = os.getenv("IMAGE_URL", "https://i.ibb.co/v4m0YmP/prediction-banner.jpg")
+# --- HARDCODED CONFIGURATION ---
+TOKEN = "8586348972:AAFAPGF45os8aEgVXW9nMwwtd4geRbMk6rc"
+ADMIN_IDS = [7166967787]
+# Default Channel ID (User should set this via command or env if not hardcoded)
+CHANNEL_ID = os.getenv("CHANNEL_ID", "-1002364448532") # Example ID, user can change
+IMAGE_URL = "https://i.ibb.co/v4m0YmP/prediction-banner.jpg"
 
 # API Configuration
 API_URL = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
@@ -25,14 +23,39 @@ HEADERS = {
     "Referer": "https://hgnice.biz"
 }
 
+# File Paths for Auto-Initialization
+DB_FILE = "bot_database.json"
+
 # Global State
 is_running = False
 last_period = None
-prediction_history = {} # Store predictions to verify later
+prediction_history = {}
 stats = {"wins": 0, "losses": 0, "total": 0}
 
 # Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+def init_db():
+    """Automatically initialize database file if it doesn't exist"""
+    if not os.path.exists(DB_FILE):
+        with open(DB_FILE, 'w') as f:
+            json.dump({"stats": stats, "admins": ADMIN_IDS, "channel_id": CHANNEL_ID}, f)
+        logging.info("Database initialized.")
+    else:
+        with open(DB_FILE, 'r') as f:
+            data = json.load(f)
+            global stats, ADMIN_IDS, CHANNEL_ID
+            stats = data.get("stats", stats)
+            # Merge hardcoded admins with DB admins
+            db_admins = data.get("admins", [])
+            for admin in db_admins:
+                if admin not in ADMIN_IDS:
+                    ADMIN_IDS.append(admin)
+            CHANNEL_ID = data.get("channel_id", CHANNEL_ID)
+
+def save_db():
+    with open(DB_FILE, 'w') as f:
+        json.dump({"stats": stats, "admins": ADMIN_IDS, "channel_id": CHANNEL_ID}, f)
 
 def get_big_small(number):
     return "SMALL" if int(number) <= 4 else "BIG"
@@ -51,7 +74,6 @@ def fetch_latest_data():
         return []
 
 def analyze_trends(data):
-    """Unique Feature: Smart Trend Analyzer"""
     if not data: return "NEUTRAL"
     numbers = [int(item['number']) for item in data[:10]]
     big_count = sum(1 for n in numbers if n >= 5)
@@ -62,22 +84,14 @@ def analyze_trends(data):
 def generate_prediction(last_results):
     if not last_results:
         return "BIG", random.randint(5, 9)
-    
     numbers = [int(r['number']) for r in last_results[:5]]
     big_count = sum(1 for n in numbers if n >= 5)
     small_count = 5 - big_count
-    
-    # Advanced logic: Trend following with randomness filter
     if big_count > small_count:
         prediction = "SMALL" if random.random() > 0.7 else "BIG"
     else:
         prediction = "BIG" if random.random() > 0.7 else "SMALL"
-    
-    if prediction == "BIG":
-        predicted_number = random.choice([5, 6, 7, 8, 9])
-    else:
-        predicted_number = random.choice([0, 1, 2, 3, 4])
-        
+    predicted_number = random.choice([5, 6, 7, 8, 9]) if prediction == "BIG" else random.choice([0, 1, 2, 3, 4])
     return prediction, predicted_number
 
 def format_prediction_message(period, prediction, number, trend):
@@ -103,19 +117,17 @@ def format_prediction_message(period, prediction, number, trend):
     return msg
 
 async def verify_last_prediction(context, current_period, actual_number):
-    """Unique Feature: Auto-Result Verification"""
     global stats
     if current_period in prediction_history:
         pred_data = prediction_history[current_period]
         actual_size = get_big_small(actual_number)
-        
         is_win = pred_data['prediction'] == actual_size
-        status_emoji = "✅ WIN" if is_win else "❌ LOSS"
-        
         if is_win: stats['wins'] += 1
         else: stats['losses'] += 1
         stats['total'] += 1
+        save_db()
         
+        status_emoji = "✅ WIN" if is_win else "❌ LOSS"
         verify_msg = (
             f"📊 *PERIOD {current_period} RESULT*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -125,75 +137,58 @@ async def verify_last_prediction(context, current_period, actual_number):
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📈 Accuracy: `{(stats['wins']/stats['total']*100):.1f}%`"
         )
-        await context.bot.send_message(chat_id=CHANNEL_ID, text=verify_msg, parse_mode='Markdown')
+        try:
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=verify_msg, parse_mode='Markdown')
+        except: pass
         del prediction_history[current_period]
 
 async def prediction_loop(context: ContextTypes.DEFAULT_TYPE):
     global is_running, last_period
-    
     while is_running:
         try:
             data = fetch_latest_data()
             if not data:
                 await asyncio.sleep(10)
                 continue
-                
             latest_item = data[0]
             current_period = str(latest_item['issueNumber'])
-            
-            # 1. Verify previous prediction if exists
             await verify_last_prediction(context, current_period, latest_item['number'])
-            
-            # 2. Check if it's time for a new prediction
             if current_period != last_period:
                 last_period = current_period
                 next_period = str(int(current_period) + 1)
-                
                 trend = analyze_trends(data)
                 prediction, number = generate_prediction(data)
-                
-                # Store for verification
                 prediction_history[next_period] = {'prediction': prediction, 'number': number}
-                
                 message = format_prediction_message(next_period, prediction, number, trend)
-                
-                await context.bot.send_photo(
-                    chat_id=CHANNEL_ID,
-                    photo=IMAGE_URL,
-                    caption=message
-                )
-                logging.info(f"Sent prediction for period {next_period}")
-                
+                try:
+                    await context.bot.send_photo(chat_id=CHANNEL_ID, photo=IMAGE_URL, caption=message)
+                except Exception as e:
+                    logging.error(f"Send error: {e}")
             await asyncio.sleep(15)
         except Exception as e:
-            logging.error(f"Error in prediction loop: {e}")
+            logging.error(f"Loop error: {e}")
             await asyncio.sleep(10)
 
-# Commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Unauthorized.")
-        return
-        
+    if update.effective_user.id not in ADMIN_IDS: return
     keyboard = [
         [InlineKeyboardButton("🚀 Start", callback_data='start_bot'), InlineKeyboardButton("🛑 Stop", callback_data='stop_bot')],
         [InlineKeyboardButton("📊 Stats", callback_data='status_bot'), InlineKeyboardButton("📢 Broadcast", callback_data='prep_broadcast')],
-        [InlineKeyboardButton("⚙️ Settings", callback_data='settings_bot')]
+        [InlineKeyboardButton("🆔 Set Channel", callback_data='set_channel')]
     ]
     await update.message.reply_text(
         "🔥 *ULTIMATE PREDICTION CONTROL*\n\n"
-        "Status: " + ("RUNNING 🟢" if is_running else "STOPPED 🔴"),
+        f"Status: {'RUNNING 🟢' if is_running else 'STOPPED 🔴'}\n"
+        f"Channel: `{CHANNEL_ID}`",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global is_running
+    global is_running, CHANNEL_ID
     query = update.callback_query
     if query.from_user.id not in ADMIN_IDS: return
     await query.answer()
-    
     if query.data == 'start_bot':
         if not is_running:
             is_running = True
@@ -205,20 +200,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'status_bot':
         await query.edit_message_text(f"📊 *LIFETIME STATS*\n\nWins: {stats['wins']}\nLosses: {stats['losses']}\nTotal: {stats['total']}", parse_mode='Markdown')
     elif query.data == 'prep_broadcast':
-        await query.edit_message_text("📝 Send the message you want to broadcast to the channel.")
+        await query.edit_message_text("📝 Send the message you want to broadcast.")
         context.user_data['awaiting_broadcast'] = True
+    elif query.data == 'set_channel':
+        await query.edit_message_text("🆔 Send the Channel ID (e.g., -100...).")
+        context.user_data['awaiting_channel'] = True
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unique Feature: Admin Broadcast"""
+    global CHANNEL_ID
     if update.effective_user.id not in ADMIN_IDS: return
-    
     if context.user_data.get('awaiting_broadcast'):
-        text = update.message.text
-        await context.bot.send_message(chat_id=CHANNEL_ID, text=f"📢 *ADMIN ANNOUNCEMENT*\n\n{text}", parse_mode='Markdown')
-        await update.message.reply_text("✅ Broadcast sent to channel!")
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=f"📢 *ADMIN ANNOUNCEMENT*\n\n{update.message.text}", parse_mode='Markdown')
+        await update.message.reply_text("✅ Broadcast sent!")
         context.user_data['awaiting_broadcast'] = False
+    elif context.user_data.get('awaiting_channel'):
+        CHANNEL_ID = update.message.text
+        save_db()
+        await update.message.reply_text(f"✅ Channel ID updated to: `{CHANNEL_ID}`", parse_mode='Markdown')
+        context.user_data['awaiting_channel'] = False
 
 if __name__ == '__main__':
+    init_db()
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
